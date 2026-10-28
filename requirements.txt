@@ -1,0 +1,7 @@
+streamlit
+supabase
+pandas
+numpy
+plotly
+openai
+openpyxl

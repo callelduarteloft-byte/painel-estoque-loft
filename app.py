@@ -7,6 +7,7 @@ from openai import OpenAI
 import re
 import os
 import glob
+from pathlib import Path
 from datetime import datetime
 
 # ==========================================
@@ -47,26 +48,101 @@ def gerar_arquivo_csv(df_exportacao: pd.DataFrame) -> bytes:
     return df_exportacao.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 
 
+def ordenar_meses_cronologicamente(lista_meses: list[str]) -> list[str]:
+    """Ordena meses no formato MM-AA (ex: '09-25', '10-25', '01-26') na ordem cronológica exata."""
+    def chave_mes(m_str: str):
+        try:
+            partes = str(m_str).strip().split("-")
+            mes = int(partes[0])
+            ano = int(partes[1]) + 2000
+            return (ano, mes)
+        except Exception:
+            return (0, 0)
+
+    unicos = list(dict.fromkeys([str(m).strip() for m in lista_meses if pd.notna(m) and str(m).strip() != ""]))
+    return sorted(unicos, key=chave_mes)
+
+
 def encontrar_planilha_local() -> str | None:
-    """Localiza automaticamente a planilha '5 - Análise Estoque.xlsx' na pasta do projeto."""
-    candidatos = [
+    """
+    Localiza automaticamente a planilha '5 - Análise Estoque.xlsx' tanto na pasta OneDrive oficial
+    ('OneDrive - Gustavo - Pessoal / One Drive LOFT') quanto na pasta local do projeto,
+    priorizando sempre o arquivo com a data de modificação mais recente.
+    """
+    candidatos_encontrados = []
+
+    # 1. Procura nas pastas OneDrive do usuário (incluindo OneDrive LOFT)
+    try:
+        home = Path.home()
+        for pasta_od in home.glob("OneDrive*"):
+            if pasta_od.is_dir():
+                for arq in pasta_od.rglob("*An*lise*Estoque*.xls*"):
+                    if not arq.name.startswith("~$"):
+                        candidatos_encontrados.append(arq)
+    except Exception:
+        pass
+
+    # 2. Procura na pasta atual do projeto
+    nomes_diretos = [
         "5 - Análise Estoque.xlsx",
         "5 - Analise Estoque.xlsx",
         "5 - Análise Estoque.xls",
     ]
-    for nome in candidatos:
+    for nome in nomes_diretos:
         if os.path.exists(nome):
-            return nome
+            candidatos_encontrados.append(Path(nome).resolve())
 
-    for arq in glob.glob("*.xls*"):
-        nome_low = arq.lower()
-        if "estoque" in nome_low or "analise" in nome_low or "análise" in nome_low or "5" in nome_low:
-            return arq
+    for arq_str in glob.glob("*.xls*"):
+        if not os.path.basename(arq_str).startswith("~$"):
+            nome_low = arq_str.lower()
+            if "estoque" in nome_low or "analise" in nome_low or "análise" in nome_low or "5" in nome_low:
+                candidatos_encontrados.append(Path(arq_str).resolve())
+
+    if candidatos_encontrados:
+        mais_recente = max(candidatos_encontrados, key=lambda p: p.stat().st_mtime)
+        return str(mais_recente)
+
     return None
 
 
+def obter_cliente_supabase() -> Client | None:
+    """Conecta ao Supabase usando st.secrets (Nuvem ou Local)."""
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        pass
+    return None
+
+
+def buscar_tabela_completa_supabase(_client: Client, nome_tabela: str, tamanho_lote: int = 1000) -> pd.DataFrame:
+    """
+    Busca 100% dos registros de uma tabela do Supabase paginando em blocos de 1.000 linhas
+    para contornar o limite padrão da API e trazer todos os +26.000 registros sem perdas.
+    """
+    todos_registros = []
+    inicio = 0
+    while True:
+        res = (
+            _client.table(nome_tabela)
+            .select("*")
+            .range(inicio, inicio + tamanho_lote - 1)
+            .execute()
+        )
+        dados = res.data
+        if not dados:
+            break
+        todos_registros.extend(dados)
+        if len(dados) < tamanho_lote:
+            break
+        inicio += tamanho_lote
+    return pd.DataFrame(todos_registros)
+
+
 # ==========================================
-# 3. EXTRAÇÃO PROFUNDA DA '5 - Análise Estoque.xlsx'
+# 3. EXTRAÇÃO PROFUNDA DA '5 - Análise Estoque.xlsx' E SUPABASE
 # ==========================================
 def ler_aba_curva_completa(xls: pd.ExcelFile, nome_aba: str) -> pd.DataFrame:
     df_raw = pd.read_excel(xls, sheet_name=nome_aba)
@@ -182,90 +258,184 @@ def ler_aba_estoque_completa(xls: pd.ExcelFile, nome_aba: str) -> pd.DataFrame:
     return df_est.drop_duplicates("codigo")
 
 
-@st.cache_data(ttl=1200, show_spinner=False)
+def construir_master_a_partir_de_bases(df_est_atual: pd.DataFrame, df_curva_atual: pd.DataFrame) -> pd.DataFrame:
+    """Consolida o Catálogo Mestre do último mês unindo Estoque Completo + Curva ABC com todas as métricas."""
+    df_master = pd.merge(df_est_atual, df_curva_atual, on="codigo", how="outer", suffixes=("_est_dup", ""))
+
+    if "produto_est" in df_master.columns:
+        df_master["produto"] = df_master.get("produto", pd.Series(dtype=object)).combine_first(df_master["produto_est"]).fillna("Sem Nome")
+    else:
+        df_master["produto"] = df_master.get("produto", pd.Series("Sem Nome", index=df_master.index)).fillna("Sem Nome")
+
+    if "grupo_est" in df_master.columns:
+        df_master["grupo"] = df_master.get("grupo", pd.Series(dtype=object)).combine_first(df_master["grupo_est"]).fillna("GERAL").astype(str).str.strip().str.upper()
+    else:
+        df_master["grupo"] = df_master.get("grupo", pd.Series("GERAL", index=df_master.index)).fillna("GERAL").astype(str).str.strip().str.upper()
+
+    if "familia_est" in df_master.columns:
+        df_master["familia"] = df_master.get("familia", pd.Series(dtype=object)).combine_first(df_master["familia_est"]).fillna("GERAL").astype(str).str.strip().str.upper()
+    else:
+        df_master["familia"] = df_master.get("familia", pd.Series("GERAL", index=df_master.index)).fillna("GERAL").astype(str).str.strip().str.upper()
+
+    df_master["curva_abc"] = df_master.get("curva_abc", pd.Series("S/ Curva", index=df_master.index)).fillna("S/ Curva")
+    df_master["abc_shop"] = df_master.get("abc_shop", pd.Series("S/ Curva", index=df_master.index)).fillna("S/ Curva")
+    df_master["abc_aero"] = df_master.get("abc_aero", pd.Series("S/ Curva", index=df_master.index)).fillna("S/ Curva")
+
+    # Garante colunas de preço e estoque vindas de ambas as pontas
+    if "atacado_padrao_est_dup" in df_master.columns:
+        df_master["atacado_padrao"] = df_master["atacado_padrao_est_dup"].combine_first(df_master.get("atacado_padrao"))
+    if "preco_lojas_est_dup" in df_master.columns:
+        df_master["preco_lojas"] = df_master["preco_lojas_est_dup"].combine_first(df_master.get("preco_lojas"))
+
+    df_master["qt_estoque"] = pd.to_numeric(
+        df_master.get("qtd_cd_estoque", pd.Series(dtype=float)).combine_first(df_master.get("estoque_cd", pd.Series(dtype=float))),
+        errors="coerce",
+    ).fillna(0.0)
+
+    atacado_pad = pd.to_numeric(df_master.get("atacado_padrao", 0.0), errors="coerce").fillna(0.0)
+    tab_atacado = pd.to_numeric(df_master.get("tabela_atacado", 0.0), errors="coerce").fillna(0.0)
+    df_master["val_custo"] = np.where(atacado_pad > 0, atacado_pad, tab_atacado)
+    df_master["preco_lojas"] = pd.to_numeric(df_master.get("preco_lojas", 0.0), errors="coerce").fillna(0.0)
+
+    for col_z in [
+        "qt_est_rede", "qt_venda", "qt_sell_in", "cap_sup_rede", "estoque_cd",
+        "cap_sup_cd", "cap_sup_total", "val_total_venda", "markup",
+        "qt_est_shop", "qt_venda_shop", "cap_sup_shop", "val_total_shop",
+        "qt_est_aero", "qt_venda_aero", "cap_sup_aero", "val_total_aero",
+    ]:
+        if col_z in df_master.columns:
+            df_master[col_z] = pd.to_numeric(df_master[col_z], errors="coerce").fillna(0.0)
+        else:
+            df_master[col_z] = 0.0
+
+    df_master["estoque_total_empresa"] = df_master["qt_estoque"] + df_master["qt_est_rede"]
+    df_master["capital_imobilizado"] = (df_master["qt_estoque"] * df_master["val_custo"]).round(2)
+    df_master["capital_lojas"] = (df_master["qt_est_rede"] * df_master["val_custo"]).round(2)
+    df_master["capital_total_rede_cd"] = (df_master["capital_imobilizado"] + df_master["capital_lojas"]).round(2)
+
+    df_master["quantidade_a_receber"] = 0.0
+    df_master["rma_pct_display"] = 0.0
+
+    return df_master.drop_duplicates("codigo")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def carregar_ecossistema_analise_estoque(ultimos_n_meses: int = 12):
     """
-    Constrói todo o ecossistema da LOFT diretamente a partir da '5 - Análise Estoque.xlsx'
-    (ou fallback do Supabase para o catálogo base caso o Excel não esteja na pasta).
+    Constrói todo o ecossistema da LOFT:
+    1º Tenta ler diretamente da planilha '5 - Análise Estoque.xlsx' (OneDrive LOFT ou pasta local).
+    2º Se estiver rodando na Nuvem (Streamlit Cloud) ou sem a planilha local, lê 100% do Supabase!
     """
+    # ROTA 1: Planilha Local / OneDrive (Quando rodando na máquina local)
     caminho_excel = encontrar_planilha_local()
     if caminho_excel:
-        xls = pd.ExcelFile(caminho_excel)
-        abas_curva = [s for s in xls.sheet_names if s.startswith("Curva ")]
-        meses_disponiveis = [s.replace("Curva ", "").strip() for s in abas_curva]
-        meses_recorte = meses_disponiveis[-ultimos_n_meses:]
-        ultimo_mes = meses_recorte[-1]
+        try:
+            xls = pd.ExcelFile(caminho_excel)
+            abas_curva = [s for s in xls.sheet_names if s.startswith("Curva ")]
+            meses_disponiveis = [s.replace("Curva ", "").strip() for s in abas_curva]
+            meses_recorte = meses_disponiveis[-ultimos_n_meses:]
+            ultimo_mes = meses_recorte[-1]
 
-        lista_historico = []
-        for m in meses_recorte:
-            aba_c = f"Curva {m}"
-            aba_e = f"Estoque {m}"
-            df_c = ler_aba_curva_completa(xls, aba_c)
-            if aba_e in xls.sheet_names:
-                df_e = ler_aba_estoque_completa(xls, aba_e)
-                df_c = df_c.merge(
-                    df_e[["codigo", "atacado_padrao", "tabela_franquia", "preco_lojas", "qtd_cd_estoque"]],
-                    on="codigo",
-                    how="left",
-                )
-            else:
-                df_c["atacado_padrao"] = df_c["tabela_atacado"]
-                df_c["tabela_franquia"] = 0.0
-                df_c["preco_lojas"] = 0.0
-                df_c["qtd_cd_estoque"] = df_c["estoque_cd"]
-            df_c["mes_ref"] = m
-            lista_historico.append(df_c)
+            lista_historico = []
+            for m in meses_recorte:
+                aba_c = f"Curva {m}"
+                aba_e = f"Estoque {m}"
+                df_c = ler_aba_curva_completa(xls, aba_c)
+                if aba_e in xls.sheet_names:
+                    df_e = ler_aba_estoque_completa(xls, aba_e)
+                    df_c = df_c.merge(
+                        df_e[["codigo", "atacado_padrao", "tabela_franquia", "preco_lojas", "qtd_cd_estoque"]],
+                        on="codigo",
+                        how="left",
+                    )
+                else:
+                    df_c["atacado_padrao"] = df_c["tabela_atacado"]
+                    df_c["tabela_franquia"] = 0.0
+                    df_c["preco_lojas"] = 0.0
+                    df_c["qtd_cd_estoque"] = df_c["estoque_cd"]
+                df_c["mes_ref"] = m
+                lista_historico.append(df_c)
 
-        df_hist = pd.concat(lista_historico, ignore_index=True)
+            df_hist = pd.concat(lista_historico, ignore_index=True)
 
-        # Constrói o Catálogo Mestre do Último Mês unindo a aba Estoque completa (9.214 SKUs) + Curva completa (2.031 SKUs)
-        df_est_atual = ler_aba_estoque_completa(xls, f"Estoque {ultimo_mes}")
-        df_curva_atual = ler_aba_curva_completa(xls, f"Curva {ultimo_mes}")
+            df_est_atual = ler_aba_estoque_completa(xls, f"Estoque {ultimo_mes}")
+            df_curva_atual = ler_aba_curva_completa(xls, f"Curva {ultimo_mes}")
+            df_master = construir_master_a_partir_de_bases(df_est_atual, df_curva_atual)
 
-        df_master = pd.merge(df_est_atual, df_curva_atual, on="codigo", how="outer")
-        df_master["produto"] = df_master["produto"].combine_first(df_master["produto_est"]).fillna("Sem Nome")
-        df_master["grupo"] = df_master["grupo"].combine_first(df_master["grupo_est"]).fillna("GERAL").astype(str).str.strip().str.upper()
-        df_master["familia"] = df_master["familia"].combine_first(df_master["familia_est"]).fillna("GERAL").astype(str).str.strip().str.upper()
-        df_master["curva_abc"] = df_master["curva_abc"].fillna("S/ Curva")
-        df_master["abc_shop"] = df_master["abc_shop"].fillna("S/ Curva")
-        df_master["abc_aero"] = df_master["abc_aero"].fillna("S/ Curva")
+            return df_master, df_hist, meses_recorte, f"Planilha Oficial ({os.path.basename(caminho_excel)} | Mês {ultimo_mes})"
+        except Exception as e_excel:
+            st.warning(f"Aviso ao ler planilha local ({e_excel}). Acionando banco de dados em nuvem (Supabase)...")
 
-        # Quantidade em estoque CD e Preço de Custo/Atacado
-        df_master["qt_estoque"] = df_master["qtd_cd_estoque"].combine_first(df_master["estoque_cd"]).fillna(0.0)
-        df_master["val_custo"] = np.where(
-            df_master["atacado_padrao"].fillna(0) > 0,
-            df_master["atacado_padrao"],
-            df_master["tabela_atacado"].fillna(0),
-        )
-        df_master["preco_lojas"] = df_master["preco_lojas"].fillna(0.0)
+    # ROTA 2: Nuvem Supabase (Quando rodando no Streamlit Cloud ou sem Excel local)
+    client_supa = obter_cliente_supabase()
+    if client_supa is not None:
+        try:
+            df_hist = buscar_tabela_completa_supabase(client_supa, "loft_historico_curva")
+            df_cat = buscar_tabela_completa_supabase(client_supa, "loft_catalogo_estoque")
 
-        for col_z in [
-            "qt_est_rede", "qt_venda", "qt_sell_in", "cap_sup_rede", "estoque_cd",
-            "cap_sup_cd", "cap_sup_total", "val_total_venda", "markup",
-            "qt_est_shop", "qt_venda_shop", "cap_sup_shop", "val_total_shop",
-            "qt_est_aero", "qt_venda_aero", "cap_sup_aero", "val_total_aero",
-        ]:
-            df_master[col_z] = pd.to_numeric(df_master.get(col_z, 0.0), errors="coerce").fillna(0.0)
+            if not df_hist.empty:
+                df_hist["codigo"] = normalizar_sku(df_hist["codigo"])
+                cols_num_h = [
+                    "qt_est_rede", "qt_venda", "qt_sell_in", "cap_sup_rede", "val_custo_venda",
+                    "val_total_venda", "estoque_cd", "cap_sup_cd", "cap_sup_total", "tabela_atacado",
+                    "atacado_padrao", "preco_lojas", "markup", "qt_est_shop", "qt_venda_shop",
+                    "cap_sup_shop", "val_total_shop", "qt_est_aero", "qt_venda_aero", "cap_sup_aero", "val_total_aero",
+                ]
+                for c_num in cols_num_h:
+                    if c_num in df_hist.columns:
+                        df_hist[c_num] = pd.to_numeric(df_hist[c_num], errors="coerce").fillna(0.0)
+                    else:
+                        df_hist[c_num] = 0.0
 
-        df_master["estoque_total_empresa"] = df_master["qt_estoque"] + df_master["qt_est_rede"]
-        df_master["capital_imobilizado"] = (df_master["qt_estoque"] * df_master["val_custo"]).round(2)
-        df_master["capital_lojas"] = (df_master["qt_est_rede"] * df_master["val_custo"]).round(2)
-        df_master["capital_total_rede_cd"] = (df_master["capital_imobilizado"] + df_master["capital_lojas"]).round(2)
+                for col_txt in ["curva_abc", "abc_shop", "abc_aero", "grupo", "familia"]:
+                    if col_txt in df_hist.columns:
+                        df_hist[col_txt] = df_hist[col_txt].fillna("S/ Curva").astype(str).str.strip()
+                    else:
+                        df_hist[col_txt] = "S/ Curva"
 
-        # Sem planilha de recompra subida, A Receber e RMA iniciam zerados (serão preenchidos quando subir a planilha de recompra)
-        df_master["quantidade_a_receber"] = 0.0
-        df_master["rma_pct_display"] = 0.0
+                df_hist["dt_1_rec"] = pd.to_datetime(df_hist.get("dt_1_rec"), errors="coerce")
 
-        return df_master, df_hist, meses_recorte, f"Planilha Oficial ({os.path.basename(caminho_excel)} | Mês {ultimo_mes})"
+                meses_ordenados = ordenar_meses_cronologicamente(df_hist["mes_ref"].dropna().unique().tolist())
+                meses_recorte = meses_ordenados[-ultimos_n_meses:]
+                ultimo_mes = meses_recorte[-1]
 
-    return pd.DataFrame(), pd.DataFrame(), [], "Planilha não encontrada"
+                df_curva_atual = df_hist[df_hist["mes_ref"] == ultimo_mes].copy().drop_duplicates("codigo")
+
+                if not df_cat.empty:
+                    df_est_atual = df_cat.rename(
+                        columns={
+                            "produto": "produto_est",
+                            "grupo": "grupo_est",
+                            "familia": "familia_est",
+                        }
+                    ).copy()
+                    df_est_atual["codigo"] = normalizar_sku(df_est_atual["codigo"])
+                    for c_n in ["atacado_padrao", "tabela_franquia", "preco_lojas", "qtd_cd_estoque"]:
+                        if c_n in df_est_atual.columns:
+                            df_est_atual[c_n] = pd.to_numeric(df_est_atual[c_n], errors="coerce").fillna(0.0)
+                        else:
+                            df_est_atual[c_n] = 0.0
+                    df_est_atual = df_est_atual.drop_duplicates("codigo")
+                else:
+                    df_est_atual = pd.DataFrame(columns=["codigo", "produto_est", "atacado_padrao", "tabela_franquia", "preco_lojas", "qtd_cd_estoque", "grupo_est", "familia_est"])
+
+                df_master = construir_master_a_partir_de_bases(df_est_atual, df_curva_atual)
+                hora_leitura = datetime.now().strftime("%d/%m %H:%M")
+                return df_master, df_hist, meses_recorte, f"Supabase Nuvem (Mês {ultimo_mes} | Sinc: {hora_leitura})"
+        except Exception as e_supa:
+            st.error(f"Erro ao carregar dados do Supabase: {e_supa}")
+
+    return pd.DataFrame(), pd.DataFrame(), [], "Base não encontrada"
 
 
-with st.spinner("Extraindo inteligência completa da planilha '5 - Análise Estoque.xlsx'..."):
+with st.spinner("Carregando inteligência completa de estoque LOFT (OneDrive / Supabase)..."):
     df_completo, df_historico_mensal, meses_planilha, fonte_ativa = carregar_ecossistema_analise_estoque(ultimos_n_meses=12)
 
 if df_completo.empty:
-    st.error("Coloque o arquivo '5 - Análise Estoque.xlsx' na pasta do projeto para carregar a base oficial.")
+    st.error(
+        "Não foi possível carregar a base oficial via Planilha Local nem via Supabase. "
+        "No Streamlit Cloud, confira em 'Manage app -> Settings -> Secrets' se SUPABASE_URL e SUPABASE_KEY estão preenchidas corretamente."
+    )
     st.stop()
 
 
@@ -294,11 +464,11 @@ with st.sidebar:
     grupos_escolhidos = st.multiselect("Filtrar por Grupo", sorted(df_completo["grupo"].unique()))
 
     st.divider()
-    if st.button("🔄 Recarregar Planilha Base", use_container_width=True):
+    if st.button("🔄 Atualizar Base Agora", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    st.caption(f"Fonte Ativa: **{fonte_ativa}**")
+    st.caption(f"🟢 Fonte Ativa: **{fonte_ativa}**")
     st.caption(f"Catálogo Total: **{formatar_inteiro(len(df_completo))} SKUs**")
 
 
@@ -346,7 +516,6 @@ if arquivo_recompra is not None:
 
             if col_rma is not None:
                 rma_vals = pd.to_numeric(df_rec_raw[col_rma], errors="coerce").fillna(0.0)
-                # Se estiver em fração (ex: 0.05), converte para percentual (5.0%)
                 if rma_vals.max() <= 1.0 and rma_vals.max() > 0:
                     rma_vals = rma_vals * 100.0
                 df_rec_proc["rma_input"] = rma_vals.round(2)
@@ -587,7 +756,7 @@ st.markdown(
     <div class="painel-header">
         <div>
             <h1 class="painel-titulo">📦 Painel Estratégico de Estoque - LOFT</h1>
-            <div class="painel-subtitulo">Base 100% Oficial ('5 - Análise Estoque.xlsx'): CD vs. Lojas, Shopping vs. Aeroporto, Elasticidade de Preço e Simulador de Recompra</div>
+            <div class="painel-subtitulo">Base 100% Oficial ('5 - Análise Estoque.xlsx' / Supabase Cloud): CD vs. Lojas, Shopping vs. Aeroporto, Elasticidade de Preço e Simulador de Recompra</div>
         </div>
         <div class="painel-badge">
             {formatar_inteiro(len(df))} SKUs na Visão
@@ -1169,7 +1338,7 @@ def construir_inteligencia_ia(
 
     bloco_diretoria_ia = ""
     if not df_hist.empty and len(df_hist["mes_ref"].unique()) >= 2:
-        meses_disp = list(df_hist["mes_ref"].unique())
+        meses_disp = ordenar_meses_cronologicamente(list(df_hist["mes_ref"].unique()))
         m_atu, m_ant = meses_disp[-1], meses_disp[-2]
         d_atu = df_hist[df_hist["mes_ref"] == m_atu].copy()
         d_ant = df_hist[df_hist["mes_ref"] == m_ant].copy()
@@ -1335,7 +1504,7 @@ with aba_ia:
     col_cab_ia, col_filtro_ia, col_reset_ia = st.columns([3, 2, 1])
     with col_cab_ia:
         st.markdown("#### 🧠 Assistente Executivo de Inventário LOFT")
-        st.caption("Conectado 100% à planilha '5 - Análise Estoque.xlsx' + Simulador de Recompra/RMA (quando ativo).")
+        st.caption("Conectado 100% à base oficial ('5 - Análise Estoque.xlsx' / Supabase Cloud) + Simulador de Recompra/RMA.")
     with col_filtro_ia:
         ignorar_zerados_ia = st.checkbox("Ignorar cadastro morto (Focar no Estoque Ativo)", value=True)
     with col_reset_ia:
@@ -1377,7 +1546,7 @@ with aba_ia:
                 st.markdown(pergunta_ativa)
 
             with st.chat_message("assistant"):
-                with st.spinner("Analisando base oficial '5 - Análise Estoque.xlsx'..."):
+                with st.spinner("Analisando base oficial de estoque..."):
                     try:
                         cliente_ia = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
@@ -1451,5 +1620,4 @@ with aba_tabela:
     ]
     cols_exibir_tab = [c for c in cols_exibir_tab if c in df_mostrado.columns]
 
-    st.caption(f"Exibindo **{formatar_inteiro(len(df_mostrado))}** produtos extraídos da planilha oficial.")
     st.dataframe(df_mostrado[cols_exibir_tab], hide_index=True, width="stretch")
